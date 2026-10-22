@@ -1,0 +1,500 @@
+#!/bin/bash
+# The Endurance 1.0.4 - control window (Endurance style, same look as the browser page): status, monitoring times menu, purge RAM, OSC monitor, Start / Stop.
+# Also: "launcher --status" and "launcher --do <command>" (used by the window). If the window cannot open, a plain dialog version is used.
+# Non apre il browser. Il monitor si guarda dal telefono.
+VER="1.0.4"
+# On Apple Silicon the app may start under Rosetta (translated); the graphic window needs a native process.
+if [ "$(sysctl -n sysctl.proc_translated 2>/dev/null)" = "1" ] && [ -z "$DP_NATIVE" ]; then
+  export DP_NATIVE=1
+  exec /usr/bin/arch -arm64 /bin/bash "$0" "$@"
+fi
+DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
+LOG="$HOME/Library/Logs/endurance.log"
+UI_DIR="/tmp/endurance-ui-test"
+PORT=18301
+# Python is bundled inside the app (Apple Silicon and Intel versions), so nothing has to be installed on the Mac.
+# The Apple /usr/bin/python3 is only a last resort: without the developer tools it just asks to install them.
+unset PYTHONPATH PYTHONHOME
+export PYTHONDONTWRITEBYTECODE=1
+PYARCH=aarch64
+PY=/usr/bin/python3
+ICON="$DIR/AppIcon.icns"
+TITLE="The Endurance $VER"
+OLD_CFG="$HOME/Library/Application Support/The Magi System"
+CFG_DIR="$HOME/Library/Application Support/The Endurance"
+[ -d "$OLD_CFG" ] && [ ! -e "$CFG_DIR" ] && cp -R "$OLD_CFG" "$CFG_DIR" 2>/dev/null
+CFG="$CFG_DIR/settings"
+
+# tempi di lettura in secondi: consigliato, soglia sotto la quale e' "troppo frequente", minimo, massimo
+REC_SYS=1;    WARN_SYS=1;    MIN_SYS=1;     MAX_SYS=120
+REC_APPS=5;   WARN_APPS=3;   MIN_APPS=1;    MAX_APPS=120
+REC_QLAB=0.25; WARN_QLAB=0.1; MIN_QLAB=0.05; MAX_QLAB=5
+REC_PEERS=15; WARN_PEERS=8; MIN_PEERS=5; MAX_PEERS=300
+SYS=$REC_SYS; APPS=$REC_APPS; QLAB=$REC_QLAB; PEERS=$REC_PEERS
+
+lt() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0 < b+0)}'; }
+gt() { awk -v a="$1" -v b="$2" 'BEGIN{exit !(a+0 > b+0)}'; }
+fmt() { awk -v a="$1" 'BEGIN{printf "%g", a+0}'; }
+
+load_cfg() {
+  [ -f "$CFG" ] || return 0
+  local k v
+  while IFS='=' read -r k v; do
+    case "$k" in
+      SYS|APPS|QLAB|PEERS) if [[ "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then [ "$k$v" = "SYS5" ] || printf -v "$k" '%s' "$v"; fi ;;
+    esac
+  done < "$CFG"
+}
+
+save_cfg() {
+  mkdir -p "$CFG_DIR" && printf 'SYS=%s\nAPPS=%s\nQLAB=%s\nPEERS=%s\n' "$SYS" "$APPS" "$QLAB" "$PEERS" > "$CFG"
+}
+
+running() { pgrep -f "endurance\.py$" >/dev/null; }
+osc_running() { pgrep -f "[t]cpdump -l -U -n -p -i" >/dev/null; }
+
+# righe "Nome|indirizzo|DHCP o MANUAL|gateway" per ogni interfaccia attiva; il nome e' quello di Impostazioni di Sistema > Rete
+net_lines() {
+  local line SVC="" DEV IPA MODE RT info first found=0
+  local re_svc='^\((\*|[0-9]+)\) (.*)$' re_dev='Device: ([^)]*)\)'
+  while IFS= read -r line; do
+    if [[ "$line" =~ $re_svc ]]; then
+      SVC="${BASH_REMATCH[2]}"
+    elif [[ "$line" =~ $re_dev ]]; then
+      DEV="${BASH_REMATCH[1]}"
+      if [ -n "$DEV" ] && [ -n "$SVC" ]; then
+        IPA="$(ipconfig getifaddr "$DEV" 2>/dev/null)"
+        if [ -n "$IPA" ] && [ "${IPA#169.254.}" = "$IPA" ]; then
+          info="$(networksetup -getinfo "$SVC" 2>/dev/null)"
+          first="$(printf '%s\n' "$info" | head -n 1)"
+          case "$first" in Manual*) MODE=MANUAL ;; DHCP*) MODE=DHCP ;; BOOTP*) MODE=BOOTP ;; *) MODE="" ;; esac
+          RT="$(printf '%s\n' "$info" | sed -n 's/^Router: *\([0-9.]*\).*/\1/p' | head -n 1)"
+          [ -n "$RT" ] || RT="$(ipconfig getoption "$DEV" router 2>/dev/null)"
+          echo "$SVC|$IPA|$MODE|$RT"; found=1
+        fi
+      fi
+      SVC=""
+    fi
+  done < <(networksetup -listnetworkserviceorder 2>/dev/null)
+  if [ "$found" = 0 ]; then   # ripiego
+    for DEV in en0 en1 en2; do
+      IPA="$(ipconfig getifaddr "$DEV" 2>/dev/null)"
+      [ -n "$IPA" ] && echo "$DEV|$IPA||$(ipconfig getoption "$DEV" router 2>/dev/null)"
+    done
+  fi
+}
+
+# nomi delle interfacce attive (en0, en1...) per la cattura OSC
+net_devs() {
+  local line DEV IPA
+  while IFS= read -r line; do
+    case "$line" in
+      "Device:"*) DEV="${line#Device: }"
+        IPA="$(ipconfig getifaddr "$DEV" 2>/dev/null)"
+        [[ "$DEV" =~ ^[a-z]+[0-9]+$ ]] && [ -n "$IPA" ] && echo "$DEV" ;;
+    esac
+  done < <(networksetup -listallhardwareports 2>/dev/null)
+}
+
+jstr() { printf '%s' "$1" | tr -d '"\\\r' | tr '\n\t' '  '; }
+res() { printf '{"cmd":"%s","ok":%s,"text":"%s"}\n' "$1" "$2" "$(jstr "$3")"; }
+
+# ---- start / stop (no dialogs: the window shows the result) ----
+ERR=""
+start_it() {
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null
+  pkill -f "qlab_timers\\.py$" 2>/dev/null; pkill -f "dummy_plug\\.py$" 2>/dev/null; sleep 1   # old copies of the previous script hold QLab's port
+  DP_SYS="$SYS" DP_APPS="$APPS" DP_QLAB="$QLAB" DP_PEERS="$PEERS" nohup $PY "$DIR/endurance.py" >"$LOG" 2>&1 </dev/null &
+  for i in 1 2 3 4 5 6 7 8; do sleep 0.5; running && return 0; done
+  ERR="Could not start The Endurance. $(tail -n 4 "$LOG" 2>/dev/null)"
+  return 1
+}
+
+stop_it() {
+  pkill -f "endurance\.py$" 2>/dev/null
+  for i in 1 2 3 4 5 6; do running || return 0; sleep 0.5; done
+  pkill -9 -f "endurance\.py$" 2>/dev/null
+  sleep 0.5
+  running && { ERR="Could not stop The Endurance. Try Activity Monitor (search python)."; return 1; }
+  return 0
+}
+
+# ---- purge RAM ----
+mem_line() { $PY "$DIR/endurance.py" --mem 2>/dev/null; }
+mem_text() {  # MEM line -> "used X GB of Y GB, pressure Z, swap W GB"
+  local k a b c d
+  while IFS='|' read -r k a b c d; do
+    [ "$k" = "MEM" ] && { echo "used $a GB of $b GB, pressure $c, swap $d GB"; return; }
+  done <<< "$1"
+}
+
+do_purge() {
+  local before after k a b apps="" sep=""
+  before="$(mem_line)"
+  if ! osascript -e 'do shell script "/usr/sbin/purge" with administrator privileges' >/dev/null 2>&1; then
+    res purge false "Purge not run (password cancelled or denied)."; return
+  fi
+  sleep 3
+  after="$(mem_line)"
+  while IFS='|' read -r k a b; do
+    if [ "$k" = "APP" ]; then apps="$apps$sep[\"$(jstr "$a")\",\"$(jstr "$b")\"]"; sep=","; fi
+  done <<< "$after"
+  printf '{"cmd":"purge","ok":true,"before":"%s","after":"%s","apps":[%s]}\n' "$(jstr "$(mem_text "$before")")" "$(jstr "$(mem_text "$after")")" "$apps"
+}
+
+# ---- Free memory: list the apps using the most RAM, quit one of them (always asks the app to quit normally) ----
+apps_json() {  # stdin: APPS|name|gb|protected lines -> JSON array
+  local k a b c apps="" sep=""
+  while IFS='|' read -r k a b c; do
+    [ "$k" = "APPS" ] && { apps="$apps$sep[\"$(jstr "$a")\",\"$(jstr "$b")\",${c:-0}]"; sep=","; }
+  done
+  printf '%s' "$apps"
+}
+do_memlist() {
+  local mem list
+  mem="$(mem_line)"; list="$($PY "$DIR/endurance.py" --apps 2>/dev/null)"
+  printf '{"cmd":"memlist","ok":true,"mem":"%s","apps":[%s]}\n' "$(jstr "$(mem_text "$mem")")" "$(apps_json <<< "$list")"
+}
+do_quitapp() {  # $1 = app name (must be in the list, QLab is protected)
+  local name="$1" list before after still="false"
+  list="$($PY "$DIR/endurance.py" --apps 2>/dev/null)"
+  if [ -z "$name" ] || ! printf '%s\n' "$list" | awk -F'|' -v n="$name" '$2==n{f=1} END{exit !f}'; then res quitapp false "That app is not running any more."; return; fi
+  if [[ "$(printf '%s' "$name" | tr '[:upper:]' '[:lower:]')" == qlab* ]]; then res quitapp false "QLab is protected: quit it yourself."; return; fi
+  before="$(mem_line)"
+  if ! osascript -e 'on run argv' -e 'tell application (item 1 of argv) to quit' -e 'end run' "$name" >/dev/null 2>&1; then
+    res quitapp false "Could not ask $name to quit (macOS may need permission: System Settings > Privacy > Automation)."; return
+  fi
+  sleep 5
+  after="$(mem_line)"
+  $PY "$DIR/endurance.py" --apps 2>/dev/null | awk -F'|' -v n="$name" '$2==n{f=1} END{exit !f}' && still="true"
+  printf '{"cmd":"quitapp","ok":true,"name":"%s","still":%s,"before":"%s","after":"%s"}\n' "$(jstr "$name")" "$still" "$(jstr "$(mem_text "$before")")" "$(jstr "$(mem_text "$after")")"
+}
+do_defcon_sens() {
+  if ! running; then res defcon-sens false "Start The Endurance first."; return; fi
+  if [ "$(curl -s --max-time 3 -X POST "http://127.0.0.1:$PORT/defcon/sens?value=$1" 2>/dev/null)" = "ok" ]; then res defcon-sens true "ok"; else res defcon-sens false "The Endurance did not answer."; fi
+}
+
+# ---- OSC monitor (tcpdump with privileges, pipes in /tmp/endurance-osc) ----
+OSC_FILTER='udp and (udp[8] = 0x2f or udp[8:4] = 0x2362756e)'
+
+osc_post() {  # $1 = enable?devs=... | disable -> "ok" if the app accepted it
+  curl -s --max-time 3 -X POST "http://127.0.0.1:$PORT/osc/$1" 2>/dev/null
+}
+
+do_osc_on() {
+  local devs d script
+  if ! running; then res osc-on false "Start The Endurance first, then enable the OSC monitor."; return; fi
+  devs="$(net_devs | tr '\n' ',')lo0"
+  if [ "$(osc_post "enable?devs=$devs")" != "ok" ]; then res osc-on false "The OSC monitor could not be prepared (it is locked in SHOW mode). Try again."; return; fi
+  # tcpdump is started through a variable so that this script never matches its own pkill pattern
+  script='TD=/usr/sbin/tcp; TD="${TD}dump";'
+  for d in ${devs//,/ }; do
+    script="$script ( \$TD -l -U -n -p -i $d -s 512 -w - '$OSC_FILTER' > /tmp/endurance-osc/$d.pcap 2>/dev/null & ) >/dev/null 2>&1;"
+  done
+  if osascript - "$script" <<'OSA' >/dev/null 2>&1
+on run argv
+  do shell script (item 1 of argv) with administrator privileges
+end run
+OSA
+  then sleep 1; res osc-on true "OSC monitor active."
+  else osc_post disable >/dev/null; res osc-on false "OSC monitor not enabled (administrator password cancelled or denied)."; fi
+}
+
+do_osc_off() {
+  osc_post disable >/dev/null     # the app stops listening at once; the capture process then ends by itself
+  osascript - 'pkill -f "[t]cpdump -l -U -n -p -i"; true' <<'OSA' >/dev/null 2>&1
+on run argv
+  try
+    do shell script (item 1 of argv) with administrator privileges
+  end try
+end run
+OSA
+  res osc-off true "OSC monitor off."
+}
+
+# ---- monitoring times ----
+apply_times() {  # sys apps qlab peers -> saves; restarts The Endurance if it is running
+  SYS="$(fmt "$1")"; APPS="$(fmt "$2")"; QLAB="$(fmt "$3")"; PEERS="$(fmt "$4")"
+  save_cfg
+  if running; then stop_it && start_it; fi
+}
+
+do_times() {
+  local v i=0
+  names=(SYS APPS QLAB PEERS); mins=("$MIN_SYS" "$MIN_APPS" "$MIN_QLAB" "$MIN_PEERS"); maxs=("$MAX_SYS" "$MAX_APPS" "$MAX_QLAB" "$MAX_PEERS")
+  [ $# -eq 4 ] || { res times false "Expected four values."; return; }
+  for v in "$@"; do
+    v="${v//,/.}"
+    if ! [[ "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]] || lt "$v" "${mins[$i]}" || gt "$v" "${maxs[$i]}"; then
+      res times false "Invalid value for ${names[$i]}: allowed ${mins[$i]} to ${maxs[$i]} seconds."; return
+    fi
+    i=$((i+1))
+  done
+  ERR=""
+  if apply_times "$1" "$2" "$3" "$4"; then res times true "Saved."; else res times false "$ERR"; fi
+}
+
+# ---- DEFCON log, network, key app (the monitor must be running; the pages in the browser show the same data) ----
+need_run() { running || { res "$1" false "Start The Endurance first."; return 1; }; }
+
+do_defcon_clear() {
+  need_run defcon-clear || return
+  if [ "$(curl -s --max-time 3 -X POST "http://127.0.0.1:$PORT/defcon/clear" 2>/dev/null)" = "ok" ]; then res defcon-clear true "ok"; else res defcon-clear false "The Endurance did not answer."; fi
+}
+
+do_defcon_export() {  # $1 = pdf | csv -> file in ~/Downloads, shown in Finder
+  local ext="$1" f
+  need_run defcon-export || return
+  case "$ext" in pdf|csv) ;; *) res defcon-export false "Unknown format."; return ;; esac
+  mkdir -p "$HOME/Downloads" 2>/dev/null
+  f="$HOME/Downloads/endurance-defcon-log-$(date +%Y%m%d-%H%M%S).$ext"
+  if curl -s --max-time 20 -o "$f" "http://127.0.0.1:$PORT/defcon/export.$ext" 2>/dev/null && [ -s "$f" ]; then
+    open -R "$f" >/dev/null 2>&1
+    res defcon-export true "$(basename "$f")"
+  else rm -f "$f"; res defcon-export false "Could not save the file in Downloads."; fi
+}
+
+do_net_discover() {
+  local dev="$1"
+  need_run net-discover || return
+  [[ "$dev" =~ ^[A-Za-z0-9]{1,12}$ ]] || { res net-discover false "Invalid connection."; return; }
+  if [ "$(curl -s --max-time 3 -X POST "http://127.0.0.1:$PORT/network/discover?dev=$dev" 2>/dev/null)" = "ok" ]; then res net-discover true "ok"; else res net-discover false "busy"; fi
+}
+
+do_net_clear() {
+  need_run net-clear || return
+  if [ "$(curl -s --max-time 3 -X POST "http://127.0.0.1:$PORT/network/clear" 2>/dev/null)" = "ok" ]; then res net-clear true "ok"; else res net-clear false "busy"; fi
+}
+
+do_role() {  # $1 = self | ip, $2 = main | backup | none
+  need_run role || return
+  [[ "$1" =~ ^(self|[0-9]{1,3}(\.[0-9]{1,3}){3})$ ]] && [[ "$2" =~ ^(main|backup|none)$ ]] || { res role false "Invalid machine or role."; return; }
+  if [ "$(curl -s --max-time 3 -X POST "http://127.0.0.1:$PORT/role?target=$1&role=$2" 2>/dev/null)" = "ok" ]; then res role true "ok"; else res role false "Not accepted (only private network addresses can be main or backup)."; fi
+}
+
+do_ping() {  # $1 = ip -> JSON with the result
+  local ip="$1" out
+  need_run ping || return
+  [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || { res ping false "Invalid address."; return; }
+  out="$(curl -s --max-time 14 "http://127.0.0.1:$PORT/ping?ip=$ip" 2>/dev/null)"
+  case "$out" in "{"*"}") printf '{"cmd":"ping","ok":true,"ip":"%s","data":%s}\n' "$ip" "$out" ;; *) printf '{"cmd":"ping","ok":false,"ip":"%s","text":"no answer from the monitor"}\n' "$ip" ;; esac
+}
+
+do_keyapps() {
+  local out
+  need_run keyapps || return
+  out="$(curl -s --max-time 3 "http://127.0.0.1:$PORT/keyapps" 2>/dev/null)"
+  case "$out" in "{"*"}") printf '{"cmd":"keyapps","ok":true,"data":%s}\n' "$out" ;; *) res keyapps false "The Endurance did not answer." ;; esac
+}
+
+do_zoom() {  # $1 = small | normal | big (remembered between launches)
+  case "$1" in small|normal|big) mkdir -p "$CFG_DIR" && printf '%s' "$1" > "$CFG_DIR/zoom"; res zoom true "ok" ;; *) res zoom false "bad value" ;; esac
+}
+
+do_mode() {  # $1 = edit | show
+  need_run mode || return
+  if [ "$(curl -s --max-time 5 -X POST "http://127.0.0.1:$PORT/mode?value=$1" 2>/dev/null)" = "ok" ]; then res mode true "ok"; else res mode false "The Endurance did not answer."; fi
+}
+
+do_keyapp() {  # $1 = app name (empty = none)
+  need_run keyapp || return
+  if [ "$(curl -s --max-time 3 -X POST -G --data-urlencode "name=$1" "http://127.0.0.1:$PORT/keyapp" 2>/dev/null)" = "ok" ]; then res keyapp true "ok"; else res keyapp false "The Endurance did not answer."; fi
+}
+
+# ---- status for the window ($1 = tab shown in the window: home, defcon, osc, autosave, network) ----
+status_json() {
+  local run=false osc=false ST HOST NAME IPA MODE RT EXTRA="null" EP="" sep=""
+  running && run=true
+  ST="$(curl -s --max-time 1 "http://127.0.0.1:$PORT/state" 2>/dev/null)"
+  case "$ST" in "{"*"}") ;; *) ST="null" ;; esac
+  case "$1" in defcon) EP=defcondata ;; osc) EP=oscdata ;; network) EP=networkdata ;; esac
+  if [ -n "$EP" ] && [ "$run" = true ]; then
+    EXTRA="$(curl -s --max-time 2 "http://127.0.0.1:$PORT/$EP" 2>/dev/null)"
+    case "$EXTRA" in "{"*"}") ;; *) EXTRA="null" ;; esac
+  fi
+  case "$ST" in *'"osc_enabled": true'*) osc=true ;; esac
+  local CACHE="$UI_DIR/nets.cache" NL=""
+  if [ -f "$CACHE" ] && [ $(( $(date +%s) - $(stat -f %m "$CACHE" 2>/dev/null || echo 0) )) -lt 30 ]; then
+    HOST="$(head -n 1 "$CACHE")"; NL="$(tail -n +2 "$CACHE")"
+  else
+    HOST="$(scutil --get LocalHostName 2>/dev/null)"; NL="$(net_lines)"
+    mkdir -p "$UI_DIR" 2>/dev/null && { printf '%s\n%s\n' "$HOST" "$NL" > "$CACHE.tmp" && mv "$CACHE.tmp" "$CACHE"; } 2>/dev/null
+  fi
+  printf '{"version":"%s","running":%s,"osc":%s,"port":%s,"host":"%s","zoom":"%s","state":%s,"extra":%s,"times":{"sys":%s,"apps":%s,"qlab":%s,"peers":%s},"nets":[' \
+    "$VER" "$run" "$osc" "$PORT" "$(jstr "$HOST")" "$(cat "$CFG_DIR/zoom" 2>/dev/null | head -c 8 | tr -dc 'a-z')" "$ST" "$EXTRA" "$(fmt "$SYS")" "$(fmt "$APPS")" "$(fmt "$QLAB")" "$(fmt "$PEERS")"
+  while IFS='|' read -r NAME IPA MODE RT; do
+    [ -n "$IPA" ] || continue
+    printf '%s{"name":"%s","ip":"%s","mode":"%s","router":"%s"}' "$sep" "$(jstr "$NAME")" "$(jstr "$IPA")" "$(jstr "$MODE")" "$(jstr "$RT")"; sep=","
+  done <<< "$NL"
+  printf ']}\n'
+}
+
+# ---- workspace autosave (the monitor must be running; the page and this window share the same setting) ----
+do_autosave() {  # $1 = 1|0, $2 = minutes
+  local en="$1" mi="$2"
+  if ! running; then res autosave false "Start The Endurance first."; return; fi
+  [[ "$mi" =~ ^[0-9]+(\.[0-9]+)?$ ]] || mi=5
+  if [ "$(curl -s --max-time 3 -X POST "http://127.0.0.1:$PORT/autosave?enabled=$en&minutes=$mi" 2>/dev/null)" = "ok" ]; then res autosave true "ok"; else res autosave false "The Endurance did not answer."; fi
+}
+
+do_cmd() {
+  local c="$1"; shift
+  ERR=""
+  case "$c" in
+    start) if running || start_it; then res start true "Running."; else res start false "$ERR"; fi ;;
+    stop) if stop_it; then res stop true "Stopped."; else res stop false "$ERR"; fi ;;
+    times) do_times "$@" ;;
+    purge) do_purge ;;
+    memlist) do_memlist ;;
+    quitapp) do_quitapp "$1" ;;
+    defcon-sens) do_defcon_sens "$1" ;;
+    osc-on) do_osc_on ;;
+    osc-off) do_osc_off ;;
+    autosave) do_autosave "$1" "$2" ;;
+    defcon-clear) do_defcon_clear ;;
+    defcon-export) do_defcon_export "$1" ;;
+    net-discover) do_net_discover "$1" ;;
+    net-clear) do_net_clear ;;
+    role) do_role "$1" "$2" ;;
+    ping) do_ping "$1" ;;
+    keyapps) do_keyapps ;;
+    keyapp) do_keyapp "$1" ;;
+    mode) do_mode "$1" ;;
+    zoom) do_zoom "$1" ;;
+    *) res "$c" false "Unknown command." ;;
+  esac
+}
+
+# ---- plain dialog version (only used when the window cannot open) ----
+fb_ask() {  # $1 message, $2 third button
+  osascript - "$1" "$2" "$TITLE" <<'OSA'
+on run argv
+  try
+    set r to display dialog (item 1 of argv) buttons {"Close", "Menu", (item 2 of argv)} default button (item 2 of argv) with title (item 3 of argv)
+  on error
+    return "Close"
+  end try
+  return button returned of r
+end run
+OSA
+}
+
+fb_info() {
+  osascript - "$1" "$TITLE" <<'OSA'
+on run argv
+  try
+    display dialog (item 1 of argv) buttons {"OK"} default button "OK" with title (item 2 of argv)
+  end try
+end run
+OSA
+}
+
+fb_ask_text() {  # $1 prompt, $2 current -> text or CANCEL
+  osascript - "$1" "$2" "$TITLE" <<'OSA'
+on run argv
+  try
+    set r to display dialog (item 1 of argv) default answer (item 2 of argv) buttons {"Cancel", "OK"} default button "OK" with title (item 3 of argv)
+  on error
+    return "CANCEL"
+  end try
+  return text returned of r
+end run
+OSA
+}
+
+fb_value() {  # $1 label, $2 current, $3 recommended, $4 warn, $5 min, $6 max
+  local v note=""
+  while true; do
+    v="$(fb_ask_text "$1"$'\n'"Seconds between readings (recommended: $3)"$'\n'"$note" "$2")"
+    [ "$v" = "CANCEL" ] && { echo CANCEL; return; }
+    v="${v//,/.}"; v="${v// /}"
+    if ! [[ "$v" =~ ^[0-9]+(\.[0-9]+)?$ ]] || lt "$v" "$5" || gt "$v" "$6"; then note="Use a number between $5 and $6."; continue; fi
+    if lt "$v" "$4"; then note="Warning: this may use system resources. Recommended: $3."; fi
+    echo "$v"; return
+  done
+}
+
+fb_menu() {
+  local c out
+  c="$(osascript - "$TITLE" <<'OSA'
+on run argv
+  set r to choose from list {"Monitoring times", "Purge RAM", "OSC monitor (enable / disable)", "Restore recommended times"} with title (item 1 of argv) with prompt "Menu" OK button name "Choose" cancel button name "Back"
+  if r is false then return "BACK"
+  return item 1 of r
+end run
+OSA
+)"
+  case "$c" in
+    "Monitoring times")
+      local a b cc d
+      a="$(fb_value "CPU, RAM, pressure, swap" "$SYS" "$REC_SYS" "$WARN_SYS" "$MIN_SYS" "$MAX_SYS")"; [ "$a" = CANCEL ] && return
+      b="$(fb_value "Applications list" "$APPS" "$REC_APPS" "$WARN_APPS" "$MIN_APPS" "$MAX_APPS")"; [ "$b" = CANCEL ] && return
+      cc="$(fb_value "QLab cue timers" "$QLAB" "$REC_QLAB" "$WARN_QLAB" "$MIN_QLAB" "$MAX_QLAB")"; [ "$cc" = CANCEL ] && return
+      d="$(fb_value "QLab on other Macs" "$PEERS" "$REC_PEERS" "$WARN_PEERS" "$MIN_PEERS" "$MAX_PEERS")"; [ "$d" = CANCEL ] && return
+      do_times "$a" "$b" "$cc" "$d" >/dev/null ;;
+    "Purge RAM") out="$(do_purge)"; fb_info "$out" ;;
+    "OSC monitor (enable / disable)") if curl -s --max-time 1 "http://127.0.0.1:$PORT/state" 2>/dev/null | grep -q '"osc_enabled": true'; then out="$(do_osc_off)"; else out="$(do_osc_on)"; fi; fb_info "$out" ;;
+    "Restore recommended times") do_times "$REC_SYS" "$REC_APPS" "$REC_QLAB" "$REC_PEERS" >/dev/null ;;
+  esac
+}
+
+fallback_loop() {
+  local B3 ans M
+  while true; do
+    if running; then B3="Stop"; else B3="Start"; fi
+    M="THE ENDURANCE $VER"$'\n'"Status: $(running && echo RUNNING || echo STOPPED)   OSC MONITOR: $(curl -s --max-time 1 "http://127.0.0.1:$PORT/state" 2>/dev/null | grep -q '"osc_enabled": true' && echo ON || echo OFF)"$'\n\n'"Device addresses (same network):"
+    while IFS='|' read -r n ip md rt; do [ -n "$ip" ] && M="$M"$'\n'"  http://$ip:$PORT  ($n${md:+, $md}${rt:+, gateway $rt})"; done <<< "$(net_lines)"
+    M="$M"$'\n'"Add /osc for the OSC monitor."$'\n\n'"crafted by Francesco Lo Brano"
+    ans="$(fb_ask "$M" "$B3")"
+    case "$ans" in
+      Start) ERR=""; start_it || fb_info "$ERR" ;;
+      Stop) ERR=""; stop_it || fb_info "$ERR" ;;
+      Menu) fb_menu ;;
+      *) exit 0 ;;
+    esac
+  done
+}
+
+# settings from the previous name (Dummy Plug)
+OLD_CFG="$HOME/Library/Application Support/Dummy Plug/settings"
+if [ ! -f "$CFG" ] && [ -f "$OLD_CFG" ]; then mkdir -p "$CFG_DIR" && cp "$OLD_CFG" "$CFG"; fi
+load_cfg
+case "$1" in
+  --status) status_json "$2"; exit 0 ;;
+  --do) shift; do_cmd "$@"; exit 0 ;;
+esac
+
+# ---- main window ----
+# downloaded apps carry a "quarantine" flag that can block the bundled Python: remove it (best effort)
+( APPDIR="$(cd "$DIR/../.." && pwd)"; xattr -dr com.apple.quarantine "$APPDIR" 2>/dev/null ) &
+# quitting the app (Cmd+Q, Close, Dock quit) also stops the monitor, the OSC monitor and autosave.
+# If a newer window is already open (the app was opened again) the monitor is left alone.
+cleanup() {
+  trap - EXIT TERM HUP INT
+  if ! pgrep -f "[m]agi_window\.js" >/dev/null 2>&1; then
+    osc_post disable >/dev/null 2>&1
+    stop_it >/dev/null 2>&1
+  fi
+  exit 0
+}
+trap cleanup EXIT TERM HUP INT
+# always start OFF: stop a monitor left running from before (this also switches the OSC monitor and autosave off)
+if running; then osc_post disable >/dev/null 2>&1; stop_it; fi
+# one window only: close a stale copy left over from an earlier launch
+pkill -f "[m]agi_window\.js" 2>/dev/null; pkill -f "[d]ummy_plug_window\.js" 2>/dev/null; sleep 0.5
+mkdir -p "$UI_DIR" && rm -f "$UI_DIR"/*.json "$UI_DIR"/*.tmp 2>/dev/null
+T0=$(date +%s)
+LIBFFI_TMPDIR="$UI_DIR" osascript -l JavaScript "$DIR/endurance_window.js" "$ICON" "$0" "$DIR/window.html" "$UI_DIR" >"$UI_DIR/window.log" 2>&1
+RC=$?
+# the window counts as opened if it reached the run loop; quitting right away (Cmd+Q) is then normal
+if ! grep -q "entering run loop" "$UI_DIR/window.log" 2>/dev/null; then
+  # one more try in safe mode (without the app-name change)
+  LIBFFI_TMPDIR="$UI_DIR" osascript -l JavaScript "$DIR/endurance_window.js" "$ICON" "$0" "$DIR/window.html" "$UI_DIR" safe >"$UI_DIR/window.log" 2>&1
+  RC=$?
+  if ! grep -q "entering run loop" "$UI_DIR/window.log" 2>/dev/null; then
+    WINERR="$(head -c 700 "$UI_DIR/window.log" 2>/dev/null | tr -d '\r')"
+    fb_info "The graphic window could not open, using the simple version."$'\n\n'"Error (please send it to the developer):"$'\n'"macOS $(sw_vers -productVersion 2>/dev/null) - $WINERR"
+    fallback_loop
+  fi
+fi
+exit 0
